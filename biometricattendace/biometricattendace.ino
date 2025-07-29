@@ -1,13 +1,9 @@
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <Adafruit_Fingerprint.h>
-// #include <SoftwareSerial.h>
-HardwareSerial mySerial(2);
 
-// #define Finger_Rx 16 
-// #define Finger_Tx 17 
-// SoftwareSerial mySerial(Finger_Rx, Finger_Tx);
-// Adafruit_Fingerprint finger = Adafruit_Fingerprint(&mySerial);
+// Use Hardware Serial (UART2) for fingerprint sensor
+HardwareSerial mySerial(2);
 Adafruit_Fingerprint finger = Adafruit_Fingerprint(&mySerial);
 
 const char *ssid = "Error 404";
@@ -15,9 +11,12 @@ const char *password = "1theke404";
 String serverURL = "http://192.168.0.146/biometricattendance/getdata.php";  
 int FingerID = 0;     
 uint8_t id;
+bool sensorInitialized = false;
 
 // FUNCTION DECLARATIONS
 void connectToWiFi();
+bool initFingerprintSensor();
+void softResetSensor();
 int getFingerprintID();
 void DisplayFingerprintID();
 void SendFingerprintID(int fingerID);
@@ -29,6 +28,9 @@ void confirmAdding();
 
 void setup() {
   Serial.begin(115200);
+  delay(1000);  // Critical delay for serial initialization
+  
+  Serial.println("\n\nStarting Biometric System...");
   
   // Initialize WiFi properly
   WiFi.mode(WIFI_OFF);
@@ -37,19 +39,17 @@ void setup() {
   
   connectToWiFi();
   
-  // Initialize fingerprint sensor
-  finger.begin(57600);
-  delay(100);  // Critical delay for sensor initialization
-  
-  Serial.println("\n\nAdafruit finger detect test");
-  
-  if (finger.verifyPassword()) {
-    Serial.println("Found fingerprint sensor!");
-  } else {
-    Serial.println("Did not find fingerprint sensor :(");
-    while (1) { delay(1); }
+  // Initialize fingerprint sensor with retry mechanism
+  if (!initFingerprintSensor()) {
+    Serial.println("Sensor initialization failed! Retrying...");
+    delay(2000);
+    if (!initFingerprintSensor()) {
+      Serial.println("Fatal error: Could not initialize sensor");
+      while(1); // Halt if sensor can't be initialized
+    }
   }
 
+  // Sensor info
   finger.getTemplateCount();
   Serial.print("Sensor contains "); 
   Serial.print(finger.templateCount); 
@@ -58,67 +58,84 @@ void setup() {
 }
 
 void loop() {
-  if(WiFi.status() != WL_CONNECTED) {
+  // Maintain WiFi connection
+  if (WiFi.status() != WL_CONNECTED) {
     connectToWiFi();
   }
   
+  // Periodically verify sensor connection
+  static unsigned long lastCheck = 0;
+  if (millis() - lastCheck > 10000) {  // Check every 10 seconds
+    if (!finger.verifyPassword()) {
+      Serial.println("Sensor not responding! Reinitializing...");
+      initFingerprintSensor();
+    }
+    lastCheck = millis();
+  }
+  
+  // Main operations
   FingerID = getFingerprintID();  
-  delay(50);  
   DisplayFingerprintID();
   ChecktoAddID();
   ChecktoDeleteID();
+  
+  delay(50);
 }
 
-void DisplayFingerprintID() {
-  if (FingerID > 0) {
-    Serial.print("Valid fingerprint detected! ID: ");
-    Serial.println(FingerID);
-    SendFingerprintID(FingerID);
-  } else if (FingerID == 0) {
-    Serial.println("Place finger on sensor");
-  } else if (FingerID == -1) {
-    Serial.println("Finger not recognized");
-  } else if (FingerID == -2) {
-    Serial.println("Sensor error");
-  }
-}
-
-void SendFingerprintID(int fingerID) {
-  HTTPClient http;
-  WiFiClient client;
+bool initFingerprintSensor() {
+  Serial.println("Initializing fingerprint sensor...");
   
-  String postData = "FingerID=" + String(fingerID);
-  http.begin(client, serverURL);
-  http.addHeader("Content-Type", "application/x-www-form-urlencoded");
+  // Try multiple baud rates
+  long baudRates[] = {57600, 115200, 9600, 38400, 19200};
   
-  int httpCode = http.POST(postData);
-  
-  if (httpCode > 0) {
-    String payload = http.getString();
-    Serial.print("HTTP Code: ");
-    Serial.println(httpCode);
-    Serial.print("Payload: ");
-    Serial.println(payload);
+  for (int i = 0; i < 5; i++) {
+    mySerial.end();
+    delay(100);
+    mySerial.begin(baudRates[i], SERIAL_8N1, 16, 17);  // UART2 pins
+    finger.begin(baudRates[i]);
     
-    if (payload.substring(0, 5) == "login") {
-      String user_name = payload.substring(5);
-      Serial.print("Welcome: ");
-      Serial.println(user_name);
-    } else if (payload.substring(0, 6) == "logout") {
-      String user_name = payload.substring(6);
-      Serial.print("Goodbye: ");
-      Serial.println(user_name);
+    // Give sensor time to initialize
+    delay(300);
+    
+    if (finger.verifyPassword()) {
+      Serial.print("Connected at ");
+      Serial.print(baudRates[i]);
+      Serial.println(" baud");
+      sensorInitialized = true;
+      return true;
     }
-  } else {
-    Serial.print("HTTP request failed, error: ");
-    Serial.println(http.errorToString(httpCode).c_str());
+    Serial.print("Failed at ");
+    Serial.print(baudRates[i]);
+    Serial.println(" baud");
   }
   
-  http.end();
-  delay(1000);
+  // Final attempt with software reset
+  softResetSensor();
+  mySerial.begin(57600, SERIAL_8N1, 16, 17);
+  finger.begin(57600);
+  delay(500);
+  
+  if (finger.verifyPassword()) {
+    Serial.println("Connected after reset at 57600 baud");
+    sensorInitialized = true;
+    return true;
+  }
+  
+  Serial.println("Sensor initialization failed");
+  sensorInitialized = false;
+  return false;
+}
+
+void softResetSensor() {
+  Serial.println("Performing software reset...");
+  uint8_t resetCmd[] = {0xEF, 0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0x01, 0x00, 0x03, 0x15, 0x00, 0x19};
+  mySerial.write(resetCmd, sizeof(resetCmd));
+  delay(1500);  // Allow time for reset
 }
 
 int getFingerprintID() {
+  if (!sensorInitialized) return -2;
+  
   uint8_t p = finger.getImage();
   switch (p) {
     case FINGERPRINT_OK:
@@ -183,7 +200,58 @@ int getFingerprintID() {
   return finger.fingerID;
 }
 
+void DisplayFingerprintID() {
+  if (FingerID > 0) {
+    Serial.print("Valid fingerprint detected! ID: ");
+    Serial.println(FingerID);
+    SendFingerprintID(FingerID);
+  } else if (FingerID == 0) {
+    // Normal "no finger" state
+  } else if (FingerID == -1) {
+    Serial.println("Finger not recognized");
+  } else if (FingerID == -2) {
+    Serial.println("Sensor error");
+  }
+}
+
+void SendFingerprintID(int fingerID) {
+  HTTPClient http;
+  WiFiClient client;
+  
+  String postData = "FingerID=" + String(fingerID);
+  http.begin(client, serverURL);
+  http.addHeader("Content-Type", "application/x-www-form-urlencoded");
+  
+  int httpCode = http.POST(postData);
+  
+  if (httpCode > 0) {
+    String payload = http.getString();
+    Serial.print("HTTP Code: ");
+    Serial.println(httpCode);
+    Serial.print("Payload: ");
+    Serial.println(payload);
+    
+    if (payload.substring(0, 5) == "login") {
+      String user_name = payload.substring(5);
+      Serial.print("Welcome: ");
+      Serial.println(user_name);
+    } else if (payload.substring(0, 6) == "logout") {
+      String user_name = payload.substring(6);
+      Serial.print("Goodbye: ");
+      Serial.println(user_name);
+    }
+  } else {
+    Serial.print("HTTP request failed, error: ");
+    Serial.println(http.errorToString(httpCode).c_str());
+  }
+  
+  http.end();
+  delay(1000);
+}
+
 void ChecktoDeleteID() {
+  if (!sensorInitialized) return;
+  
   WiFiClient client;
   HTTPClient http;
   String postData = "DeleteID=check";
@@ -233,6 +301,8 @@ uint8_t deleteFingerprint(int id) {
 }
 
 void ChecktoAddID() {
+  if (!sensorInitialized) return;
+  
   WiFiClient client;
   HTTPClient http;
   String postData = "Get_Fingerid=get_id";
@@ -422,16 +492,16 @@ void confirmAdding() {
 }
 
 void connectToWiFi() {
-  Serial.print("\n\nConnecting to ");
+  if (WiFi.status() == WL_CONNECTED) return;
+  
+  Serial.print("\nConnecting to ");
   Serial.println(ssid);
   
-  // Proper WiFi initialization sequence
   WiFi.disconnect(true);
   delay(1000);
   WiFi.mode(WIFI_STA);
-  
   WiFi.begin(ssid, password);
-
+  
   Serial.print("Connecting");
   int attempts = 0;
   while (WiFi.status() != WL_CONNECTED && attempts < 20) {
